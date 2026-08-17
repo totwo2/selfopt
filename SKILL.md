@@ -1,6 +1,7 @@
 ---
 name: selfopt
 slug: zhi-neng-py-jiao-ben-you-hua
+displayName: 智能py脚本优化
 summary: "AI 智能体自优化种子包：LLM 生成重写 + 程序把关入库，库随用户负载生长"
 agent_created: true
 read_when:
