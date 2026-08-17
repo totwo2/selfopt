@@ -1,0 +1,2 @@
+{"ts": 1784777746.858112, "name": "extract_defs", "domain": "regex-precompile", "speedup": 1.629, "old_ms": 0.54009, "new_ms": 0.33148, "witness": "custom", "complete": false, "samples": 3}
+{"ts": 1784777746.887349, "name": "build_report", "domain": "str-join", "speedup": 1.581, "old_ms": 0.01889, "new_ms": 0.01195, "witness": "custom", "complete": false, "samples": 30}

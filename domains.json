@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "note": "种子域库。只覆盖最常见场景，不求大而全。新域由 candidates.jsonl 蒸馏而来，每个用户的库随自己的负载生长。complete=true 表示该域证人在数学上完备（零一原理引子）。",
+  "domains": [
+    {
+      "id": "str-join",
+      "name": "循环内字符串拼接",
+      "scenario": "函数体里有 for 循环对字符串做 += 或 .append 后 ''.join 的等价形式",
+      "witness": {
+        "kind": "rand_rows",
+        "rows": 20,
+        "cols": 6
+      },
+      "complete": false,
+      "rewrite_hint": "改为 ''.join(...) 一次成型；保留原有分隔符与尾部行为",
+      "min_speedup": 1.05
+    },
+    {
+      "id": "regex-precompile",
+      "name": "调用内重复编译正则",
+      "scenario": "re.compile 出现在会被反复调用的函数体或循环内，模式串是字面量",
+      "witness": {
+        "kind": "rand_str",
+        "n": 8
+      },
+      "complete": false,
+      "rewrite_hint": "把 re.compile 提升到模块级常量；注意补充正例样本（随机串几乎不命中）",
+      "min_speedup": 1.05
+    },
+    {
+      "id": "sort-small-net",
+      "name": "小 n 比较器网络排序",
+      "scenario": "对固定小 n（<=8）的元素做比较交换排序，或冒泡/插入网络的内联实现",
+      "witness": {
+        "kind": "binary_seq",
+        "n": 5
+      },
+      "complete": true,
+      "rewrite_hint": "替换为认证最优网络；零一证人 2^n 完备，等价性在数学上成立",
+      "min_speedup": 1.02
+    },
+    {
+      "id": "list-to-set-membership",
+      "name": "列表成员检测",
+      "scenario": "循环内对不变列表做 `x in list`，列表长度 >4",
+      "witness": {
+        "kind": "rand_int_list",
+        "n": 8
+      },
+      "complete": false,
+      "rewrite_hint": "把列表转为 set 再做 in；注意保持元素顺序无关的语义",
+      "min_speedup": 1.05
+    },
+    {
+      "id": "dict-dispatch",
+      "name": "if-elif 长链分派",
+      "scenario": "3 个以上 elif 按同一变量的等值比较分派到常量/简单表达式",
+      "witness": {
+        "kind": "rand_str",
+        "n": 6
+      },
+      "complete": false,
+      "rewrite_hint": "改为 dict.get(key, default) 查表；覆盖默认分支语义",
+      "min_speedup": 1.02
+    },
+    {
+      "id": "lru-cache-pure",
+      "name": "纯函数重复调用",
+      "scenario": "无副作用函数在相同输入上被反复调用（输入哈希可计算）",
+      "witness": {
+        "kind": "rand_int_list",
+        "n": 4
+      },
+      "complete": false,
+      "rewrite_hint": "加 functools.lru_cache；前提：函数确实纯净、输入可哈希",
+      "min_speedup": 1.1
+    }
+  ]
+}
