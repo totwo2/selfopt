@@ -1,0 +1,2 @@
+{"ts": 1787045595.0230038, "name": "get_greeting", "domain": "dict-dispatch", "reason": "v2.1 复核实测 0.896x（反向）——dict-dispatch 域在 CPython 3.13 特化下 elif 链已更快，嵌套三元重写倒退；旧记录 1.358x 为旧 mean 点估计噪声假阳性", "recheck_speedup": 0.896}
+{"ts": 1787045595.023374, "name": "qclaw.get_os_name", "domain": "dict-dispatch", "reason": "v2.1 复核实测 0.509x（反向）——dict.get 查表比 elif 链慢近 2 倍；旧记录 1.102x 为旧 mean 点估计在微秒级测量下的噪声假阳性", "recheck_speedup": 0.509}

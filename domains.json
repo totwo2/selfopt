@@ -61,7 +61,9 @@
       },
       "complete": false,
       "rewrite_hint": "改为 dict.get(key, default) 查表；覆盖默认分支语义",
-      "min_speedup": 1.02
+      "min_speedup": 1.02,
+      "caveat": "实测校准（qclaw 跨代码库喂养 2026-08-18 + v2.1 复核）：本域在小字典上并非稳赢。键数≥4 或分支体为纯常量返回时优先用（实测 1.03–1.14x）。但：① ≤3 键且不少样本命中 default，或分支体含成员检测/f-string 拼接等真实计算时，dict 查表+lambda 开销反而更慢（实测 0.78–0.93x）；② **CPython 3.13+ 自适应特化后 elif 链已被优化得很好，重写普遍倒退**——v2.1 复核实测：elif→嵌套三元 0.896x、elif→dict.get 0.509x（get_greeting / qclaw.get_os_name 两条旧记录已作废）。结论：3.13+ 环境下本域默认不值得重写；确要重写必须先跑 adopt 的 benchmark 双条件把关，别盲目套用。",
+      "version_sensitive": true
     },
     {
       "id": "lru-cache-pure",
@@ -74,6 +76,18 @@
       "complete": false,
       "rewrite_hint": "加 functools.lru_cache；前提：函数确实纯净、输入可哈希",
       "min_speedup": 1.1
+    },
+    {
+      "id": "io-parse-cache",
+      "name": "文件 I/O 解析缓存",
+      "scenario": "反复调用、输入为文件路径且文件内容在调用间不变时，每次都 open()+json.load() 重读重解析整个文件（如记忆库 store、配置、静态 JSON 数据）。",
+      "witness": {
+        "kind": "rand_str",
+        "n": 10
+      },
+      "complete": false,
+      "rewrite_hint": "首次读取后把解析结果缓存到内存 dict(按路径)，仅在显式 save/reload 后失效；等价性依赖'文件内容调用间不变'前提。必须传 samples=真实文件路径。",
+      "min_speedup": 1.2
     }
   ]
 }

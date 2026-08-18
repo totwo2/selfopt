@@ -14,6 +14,23 @@
 > [中文] 智能体是生成器，本模块是验证器和计分器。生成可以出错，验证不能缺席。
 > [EN] The agent is the generator; this module is the verifier and scorer. Generation may err; verification must not be absent.
 
+## 数学闸门 v2.1 / Math Gate v2.1 (2026-08-18)
+
+> [中文] v2.1 把关从"点估计 + 硬门槛"升级为"统计检验 + 双条件"：
+> - **等价性**：随机 + 边界混合证人，异常语义比较（都抛同类异常 = 等价），失败返回反例样本（LLM 一次改对）
+> - **性能**：配对交替测量 + 中位数加速比 + 符号检验（sign test）；经验域 p<0.05 才入库，噪声翻不出假阳性
+> - **零一完备域**（sort-small-net）豁免显著性——正确性已数学证明，性能门槛仅为"别倒退"
+> - **交叉点 n\***：跨规模测量找"从多大输入才开始赢"（`adopt(..., analyze_crossing=True)`）
+> - **版本感知**：入库记录 py_version，旧版本记录提示"可能已失效"（CPython 3.13+ 特化会吃掉传统技巧收益）
+> - **作废机制**：`retract()` 追加作废清单，审计保留不删库（已作废 2 条 dict-dispatch 假阳性）
+> [EN] v2.1 upgrades the gate from "point estimate + hard threshold" to "statistical testing + dual conditions":
+> - **Equivalence**: random + boundary witnesses, exception-semantics comparison (both raising the same type = equal), returns counterexample on failure (LLM fixes in one pass)
+> - **Performance**: paired interleaved measurement + median speedup + sign test; empirical domains require p<0.05 to admit—noise cannot fake a speedup
+> - **Zero-one complete domains** (sort-small-net) exempt from significance—correctness is proven, the threshold only guards against regression
+> - **Crossing point n\***: cross-scale measurement finds the input size where the optimization starts winning (`adopt(..., analyze_crossing=True)`)
+> - **Version-aware**: records py_version; old-version records flagged as possibly stale (CPython 3.13+ specialization eats traditional trick gains)
+> - **Retraction**: `retract()` appends to a revocation list—audit keeps history, never deletes the library (2 dict-dispatch false positives retracted)
+
 ## 安装 / Install
 
 > [中文] 解压后把 `selfopt/` 目录放到你的 Agent 的**技能目录**下即可：

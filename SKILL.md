@@ -20,18 +20,45 @@ read_when:
 | 层 | 由谁做 | 做什么 |
 |----|--------|--------|
 | Layer 1 候选生成 | **LLM 智能体本身** | 读代码、识别可优化点、生成重写版本 |
-| Layer 2 验证门 | `selfopt.adopt` | 按域证人集查等价性，过不了就拒绝入库 |
-| Layer 3 代价评估 | `selfopt.benchmark` | 实测耗时，达标才入 `library.jsonl` |
+| Layer 2 验证门 | `selfopt.adopt` | 按域证人集（随机+边界，含异常语义）查等价性，过不了就拒绝入库 |
+| Layer 3 代价评估 | `selfopt.adopt` | 配对交替测量 + 中位数加速比 + sign-test 显著性，达标才入 `library.jsonl` |
 
 智能体是生成器，本模块是验证器和计分器。生成可以出错，验证不能缺席——这是整套设计的第一原则。
+
+## 数学闸门 v2（2026-08-18 升级：从"算术"到"统计"）
+
+v2 把把关从"点估计 + 硬门槛"升级为"统计检验 + 双条件"，两个数学升级：
+
+**等价性（堵洞1：随机证人无边界覆盖）**
+- 证人 = 随机采样 + **边界样本**（空/单元素/极值/负值/重复/中文/非法输入），边界值分析：多数 bug 在边界触发
+- **异常语义等价**：两者都抛同类型异常 = 等价（如对非法输入都抛 ValueError），不会误杀合法重写
+- 唯一数学完备域 `sort-small-net`（2^n binary_seq 穷举）不受影响
+- 实证：demo 场景1 的 join 重写在 `[]` 上旧返回 `''`、新返回 `','`，旧纯随机闸门会放行，v2 边界证人正确拒绝
+
+**性能（堵洞2：mean 点估计把噪声当加速）**
+- **配对交替测量**（同轮内 old/new 交替，控制环境漂移）+ **中位数加速比**（抗 GC/调度异常值）
+- **sign test（配对符号检验，纯 stdlib 二项分布）**：H0=新旧无差异，p = P(Bin(K,0.5) ≥ wins)
+- **双条件入库**：中位加速比 ≥ 门槛 **且**（经验域）p < SIGN_ALPHA(0.05)
+  - 零一完备域（complete=true）正确性已有数学保障 → **豁免显著性**，只要求中位加速过门槛（性能门槛意义仅为"别倒退太多"）
+- 实证：两个相同函数旧闸门 5 次 trial 里 1 次算出 1.095x 过线入库（噪声假阳性）；v2 sign-test 9 轮 p=0.25 正确拒绝；真实加速 9/9 胜 p=0.002 正确放行
+
+**统计背书**：入库记录带 `speedup_med` / `p_value` / `n_pairs` / `wins`（`speedup` 字段语义 = 中位数加速比）。存量旧记录无这些字段，`report` 会标 `[无统计背书·旧闸门记录，待复核]`——尤其 1.03x-1.10x 的低倍速记录（如 qclaw.auth_main 1.03x、qclaw.extract_docx_text 1.052x）疑似旧闸门噪声假阳性，复核时用真实负载重跑 `adopt` 确认。
+
+**反例返回（验证失败不再只回 False）**：`verify_equivalence` 返回 `(ok, counterexample)`——失败时返回首个反例样本（如 `[]`、`-1`），LLM 据此直接定位"错在哪个输入上"，一次改对，不用盲猜重写。`adopt` 的 verify 拒绝 note 带 `首个反例: ...` 且返回 `counterexample` 字段。
+
+**规模维度（交叉点 n\*）**：`crossing_analysis(fn_old, fn_new, kind, spec, sizes=..., threshold=..., sample_fn=...)` 跨规模配对测量，返回 `{"curve": [(n, speedup)...], "n_star": ...}`——n\* = 中位加速比首次 ≥ threshold 的最小规模，回答"这个优化从多大输入才开始赢"。`adopt(..., analyze_crossing=True)` 时入库记录带 `n_star` + `curve`，report 显示 `交叉点n*=...`。**注意**：默认证人类型可能与目标函数不匹配（如 str-join 域证人是 int 列表、拼接函数要字符串列表），跨规模分析用 `sample_fn` 传真实形态（与"默认证人不够用、必须传 samples"同理）。实测：join vs `+=` 加速比随规模单调上升（1 元素 ~1.4x → 1024 元素 ~9x）。
+
+**版本感知（加速比是 CPython 版本的函数）**：3.11+ 自适应特化、3.12 优化 `str +=`、3.13/3.14 tier-2 JIT 会系统性吃掉传统优化技巧收益。入库记录带 `py_version`；`report` 对旧版本记录提示 `[版本x.y，当前z.w，加速比可能已失效]`。判定"优化过时"时用当前版本重跑 `adopt` 复核，而非直接信旧记录。
+
+**作废机制（retract）**：复核发现假阳性时用 `selfopt.retract(name, reason, domain, recheck_speedup)` 追加到 `data/retracted.jsonl`——**不删 library.jsonl**（审计保留历史），report 在认证列表标 `[已作废，见下]` 并单列作废清单。已作废：`get_greeting`（复核 0.896x 反向）、`qclaw.get_os_name`（复核 0.509x 反向），均为 dict-dispatch 域旧 mean 点估计噪声假阳性。库内仍标"待复核"的旧记录（无 p_value）应优先用 v2.1 闸门重跑确认后再决定入库或作废。
 
 ## 标准流程
 
 1. **识别**：发现一段会被反复调用的函数（热点）。
 2. **重写**：LLM 生成一个更快的等价版本。
-3. **把关**：调用 `selfopt.adopt(name, fn_old, fn_new, domain_id)`。它会自动查域 → 取证人 → 验等价 → 测速度。
-   - 通过 → 记入 `data/library.jsonl`
-   - 未知域 → 记入 `data/candidates.jsonl`（生长素材）
+3. **把关**：调用 `selfopt.adopt(name, fn_old, fn_new, domain_id)`。它会自动查域 → 取证人（随机+边界）→ 验等价（含异常语义）→ 配对实测 + 符号检验 → 入库（v2 双条件）。
+   - 通过 → 记入 `data/library.jsonl`（带统计背书：speedup_med/p_value/n_pairs/wins）
+   - 未知域 → 记入 `data/candidates.jsonl`（生长素材，outcome=candidate）
    - 等价不过 → 拒绝，不污染库
 4. **成长（关键，不可省略，详见下方"⚠️ 成长触发钩子"）**：用 selfopt 时一旦遇到"已知 6 域覆盖不到"的情况，这就是成长机制的触发点——**绝不能只报"无优化"或"域不全"就结束**，必须改用描述性新 domain_id 调 `selfopt.adopt(...)` 让它进候选池，同域攒够 3 次且每次重写都真能过闸门后，调 `selfopt.add_domain(...)` 把这个模式立成正式域。
 
@@ -39,8 +66,9 @@ read_when:
 
 预置 6 个常见场景，按"证人集完备性"分两类：
 
-- **零一完备**（complete=true）：`sort-small-net` —— 用 `binary_seq` 证人，2^n 覆盖等价于任意输入，正确性有数学保障。门槛可设低（1.02x）。
+- **零一完备**（complete=true）：`sort-small-net` —— 用 `binary_seq` 证人，2^n 覆盖等价于任意输入，正确性有数学保障。门槛可设低（1.02x）；v2 下**豁免显著性检验**（正确性已证明，性能门槛仅为"别倒退太多"）。
 - **经验采样**（complete=false）：`str-join`、`regex-precompile`、`list-to-set-membership`、`dict-dispatch`、`lru-cache-pure` —— 用随机/补充样本验证，够用但不声称完备。
+- **版本敏感域**：`dict-dispatch` 已标 `version_sensitive: true`——CPython 3.13+ 自适应特化后 elif 链已被优化得很好，dict/三元重写普遍倒退（v2.1 复核：嵌套三元 0.896x、dict.get 0.509x，两条旧记录已作废）。3.13+ 环境下本域默认不值得重写，确要重写必须过 adopt 双条件把关。analyzer 扫到本域时 confidence 仅供参考，重写前先跑 benchmark。
 
 完整零一原理目前只有排序域有。**为每个新域找到自己的"零一式约简"是这套库能长多大的上限**——这是留给未来研究的地方，种子不强行解决。
 
@@ -55,7 +83,7 @@ read_when:
 
 种子域只有 6 个，**一定覆盖不到你遇到的所有可优化模式**。覆盖不到不是"没活干"，而是"该长新域了"。但是——**这一跳大模型不会自动做**：用 selfopt 扫一遍、发现域不全，很容易就"哦没优化、结束"。必须在 skill 里写死触发条件，强制去走成长机制。
 
-**⚠️ 先澄清覆盖盲区（避免被"0 信号"误导，这是实测踩过的坑）**：`analyzer` 只能静态检测 **4 类**（`str-join` / `regex-precompile` / `list-to-set-membership` / `dict-dispatch`），而 `domains.json` 实际有 **6 个域**——`sort-small-net` 与 `lru-cache-pure` 是 analyzer **扫不到**的（源码注释明写"静态难可靠检测，留给人工或 LLM 判断"）。所以 **`auto_scan` 返回 0 信号 ≠ 无优化**：可能属于那 2 个 analyzer 盲区的已知域，也可能属于全新域。**0 信号时 LLM 必须主动研判**，绝不能判"没活干"就结束。（历史教训：N_M_memory 的纯文件 I/O 解析缓存，曾因 analyzer 0 信号 + 误套已知域 `lru-cache-pure` 被拒而漏掉——正确做法是识别为全新域走成长机制。）
+**⚠️ 先澄清覆盖盲区（避免被"0 信号"误导，这是实测踩过的坑）**：`analyzer` 只能静态检测 **4 类**（`str-join` / `regex-precompile` / `list-to-set-membership` / `dict-dispatch`），而 `domains.json` 实际有 **7 个域（6 种子域 + 1 长出的 `io-parse-cache`，见下方「成长机制」实战）**——其中 `sort-small-net`、`lru-cache-pure` 是 analyzer **扫不到**的（源码注释明写"静态难可靠检测，留给人工或 LLM 判断"），`io-parse-cache` 是 round 1 实测长出的新域、分析器从未覆盖。所以 **`auto_scan` 返回 0 信号 ≠ 无优化**：可能属于那 3 个 analyzer 盲区（含长出的 `io-parse-cache`）的已知域，也可能属于全新域。**0 信号时 LLM 必须主动研判**，绝不能判"没活干"就结束。（历史教训：N_M_memory 的纯文件 I/O 解析缓存，曾因 analyzer 0 信号 + 误套已知域 `lru-cache-pure` 被拒而漏掉——正确做法是识别为全新域走成长机制。）
 
 **触发条件（满足任一即触发，不要犹豫）**：
 - `auto_scan` / `analyze_file` 返回 0 信号，但你（LLM）读代码后识别出可优化模式；
@@ -69,6 +97,8 @@ read_when:
 4. **进入候选池是即时的（第一次就记），立域不等 3 次**：用新 `domain_id` 调一次 `adopt` 就写 `data/candidates.jsonl`（这就是"进入成长机制"）。**只要该重写真能过 adopt 闸门（speedup≥门槛、等价通过），当场就 `selfopt.add_domain(entry)` 立域**（`scenario` / `witness` / `rewrite_hint` 三件套缺一不可）+ `reload_domains()` 热重载——**不要等攒够 3 次**。`DISTILL_THRESHOLD` 已设为 1，即首次候选就标记 `ready`；**下次遇到就加、就进成长机制**，而非攒满 3 次才动作。
 
 **反例（错误用法，务必避免）**：用已知域 `lru-cache-pure` 去跑一个"纯文件 I/O 解析缓存"重写，被 bench 拒（0.3x 回归）就认为"selfopt 没用、结束"。—— 这错在两处：① 用了已知域，没触发 unknown-domain 分支，所以根本没进候选池；② 被一次回归挡住就停，没意识到"纯 I/O 解析缓存不在 6 域里"本身就是要去立的新域。正确做法：改用 `io-parse-cache` 这个新域 id 去 `adopt`，让它进候选池、攒证据、最终立域。**发现域不全 = 去长域，不是扫完就完。**
+
+**⚠️ 验证闸门陷阱：集合字面量常量折叠（假加速会污染库，等于反向改进）**：给 `list-to-set-membership`（以及任何"把 `in` 容器换成 set"的优化）写测试样本时，**禁止使用集合字面量**（如 `{"a","b","c"}`）。原因：CPython 自 3.2 起会把 `x in {全常量}` 这类集合字面量在**编译期折叠成 `frozenset` 常量**（权威佐证：CPython 自带测试 `Lib/test/test_peepholer.py` 的 `test_folding_of_sets_of_constants` 断言 `a in {1,2,3}` 字节码只有 `LOAD_CONST (frozenset(...))`、无 `BUILD_SET`；核心答主 user2357112 也写明"Saving the set to a variable prevents the optimization"）。后果：若 `fn_old` 用元组/列表线性扫、`fn_new` 用集合字面量，微基准会报出**虚假加速**——我们第 2 轮就曾误认证 5 个小元组（2.56x / 1.95x），回滚才发现是这坑。闸门把它当真优化写进 `library.jsonl` = **库被污染，正好是"改进机制"的反面**。正确样本写法：用**运行时变量列表**（如 `lst = list(range(8))`，或真实负载里的可变列表），比 `x in lst`（线性）vs `x in set(lst)`（构建+查找）；真正的优化是把 `set(...)` **提到循环外/模块级只建一次**（对应域场景"列表长度>4 且循环内复用"），而不是在代码里写 `x in {字面量}`（那只是编译器作弊，不能推广到真实可变负载）。
 
 **成长 API**（在 `selfopt` 模块中）：
 
@@ -186,8 +216,11 @@ python scripts/selfopt.py scan           # 同上（自带的 scan 子命令）
 ## 实战注意事项
 
 - **样本要代表真实规模**：加速比依赖输入大小（交叉点问题）。例如 `str-join` 在大列表上才赢、小列表上 `+=` 反而快。样本太小会通过不了门槛，把本来划算的优化误杀。喂样本时按真实负载量级构造。
+- **v2 性能判定是双条件**：中位加速比 ≥ 门槛 且（经验域）sign-test p < 0.05。真实负载下若加速真实存在但幅度小（1.05x 上下），可加大 `rounds` 或喂更大样本提高检验力；不要为了过闸门刻意挑选噪声样本。
+- **自定义 samples 时边界由调用方负责**：`adopt(..., samples=...)` 会跳过域的默认证人（含边界样本），等价性只在你传的样本上验证——传真实负载的边界形态（空/极值/非法）是调用方责任。
 - **域的默认证人往往不够用**：`regex-precompile` 等域的 `rand_str` 证人匹配不到目标模式，必须传 `samples=真实数据`（如真实文件路径、真实记录）才有意义。传入自定义样本时，库记录的 `witness` 标记为 `custom`。
 - **测试隔离**：设环境变量 `SELFOPT_DATA_DIR=/tmp/xxx` 后再 import，可把库/候选写到临时目录，避免测试数据污染真实库。
+- **写 `list-to-set-membership` 样本禁用集合字面量**：CPython 会把 `x in {"a","b","c"}` 折叠成编译期 `frozenset` 常量，微基准会报虚假加速、污染库。正确写法与原理见上方「⚠️ 成长触发钩子」节的"验证闸门陷阱"。
 
 ## 设计约束
 

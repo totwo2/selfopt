@@ -13,7 +13,9 @@ selfopt — AI 智能体自优化种子包（运行时，仅依赖标准库）
   - 每个用户的库随自己的负载生长，不追求大而全
 """
 import json
+import math
 import os as _os
+import platform
 import random
 import statistics
 import string
@@ -28,6 +30,7 @@ DATA = Path(_DATA_OVERRIDE) if _DATA_OVERRIDE else (BASE / "data")
 DATA.mkdir(exist_ok=True)
 LIB = DATA / "library.jsonl"      # 已认证优化记录
 CAND = DATA / "candidates.jsonl"  # 未匹配候选（成长素材）
+RETRACT = DATA / "retracted.jsonl"  # 作废记录（审计保留：不删库，显式标注）
 DOMAINS = json.loads((BASE / "domains.json").read_text(encoding="utf-8"))
 
 # 分析器（静态扫描热点）随包发，消费方一次 import 即可用
@@ -43,6 +46,14 @@ except Exception:
     analyze_file = analyze_source = None
 
 DEFAULT_MIN_SPEEDUP = 1.05
+# 数学升级（v2 闸门）：符号检验显著性水平。
+# 经验采样域的入库条件 = 中位加速比 ≥ 门槛 且 sign-test p < SIGN_ALPHA，
+# 把"噪声被当真加速"的假阳性挡在库外（配对测量 + 分布检验，替代 mean 点估计）。
+SIGN_ALPHA = 0.05
+# 版本感知（数学升级）：加速比是 CPython 版本的函数（3.11+ 自适应特化、
+# 3.12 优化 str+=、3.13/3.14 tier-2 JIT 会系统性吃掉传统技巧收益）。
+# 入库记录带 py_version，report 时旧版本记录提示"可能已失效"。
+_CUR_PY_VERSION = platform.python_version()
 
 
 # ---------- Layer 2: 验证 ----------
@@ -50,7 +61,10 @@ DEFAULT_MIN_SPEEDUP = 1.05
 def make_witnesses(spec, n_samples=50, seed=42):
     """按域证人规格生成验证输入。
     binary_seq 是零一原理的引子：对该域而言证人集是完备的。
-    其余 kind 是经验采样——够用，但不声称完备。"""
+    其余 kind 是经验采样——随机采样 + 边界样本（空/单元素/极值/负值/重复等）。
+    边界样本（数学升级）：纯随机覆盖不到边界行为，而多数 bug 在边界触发；
+    配合 verify_equivalence 的异常语义比较，非法输入下"两者都抛同类异常"也判等价，
+    不会因边界样本误拒。"""
     rng = random.Random(seed)
     kind = spec.get("kind", "rand_int_list")
     if kind == "binary_seq":
@@ -58,37 +72,55 @@ def make_witnesses(spec, n_samples=50, seed=42):
         return [[(m >> k) & 1 for k in range(n)] for m in range(1 << n)]
     if kind == "rand_int_list":
         n = spec.get("n", 8)
-        return [[rng.randint(0, 99) for _ in range(n)] for _ in range(n_samples)]
+        rands = [[rng.randint(0, 99) for _ in range(n)] for _ in range(n_samples)]
+        return rands + [[], [0], [-1], [99] * n, [0] * n, [100, -1, 0, 99]]
     if kind == "rand_str":
         n = spec.get("n", 12)
         alpha = string.ascii_letters + string.digits
-        return ["".join(rng.choice(alpha) for _ in range(n)) for _ in range(n_samples)]
+        rands = ["".join(rng.choice(alpha) for _ in range(n)) for _ in range(n_samples)]
+        return rands + ["", "a", "A" * n, "a" * n, "中文abc123", "a b\tc\n"]
     if kind == "rand_int":
         lo = spec.get("lo", 0)
         hi = spec.get("hi", 2 ** 31)
-        return [rng.randint(lo, hi) for _ in range(n_samples)]
+        rands = [rng.randint(lo, hi) for _ in range(n_samples)]
+        return rands + [lo, hi, 0, 1, -1]
     if kind == "rand_rows":
         r, c = spec.get("rows", 20), spec.get("cols", 6)
-        return [["".join(rng.choice(string.ascii_lowercase) for _ in range(4))
-                 for _ in range(c)] for _ in range(r)]
+        rands = [["".join(rng.choice(string.ascii_lowercase) for _ in range(4))
+                  for _ in range(c)] for _ in range(r)]
+        return rands + [[], [""], ["a" * 50] * c]
     raise ValueError(f"unknown witness kind: {kind}")
 
 
+def _call(fn, s):
+    """调用并捕获结果/异常。等价性比较的是行为（含异常语义）。"""
+    try:
+        return ("ok", fn(s))
+    except Exception as e:
+        return ("err", type(e).__name__)
+
+
 def verify_equivalence(fn_old, fn_new, samples):
-    """所有证人输入上输出一致才算等价。有一个反例就拒绝。"""
+    """所有证人输入上行为一致才算等价：返回值相同，且异常语义也相同
+    （两者都抛同类型异常 = 等价，例如对非法输入都抛 ValueError）。
+    返回 (ok, counterexample)：
+    - ok=True  → counterexample=None
+    - ok=False → counterexample=第一个反例样本（数学升级：验证失败不只回 False，
+      回反例让 LLM 直接定位错在哪个输入上，一次改对，不用盲猜重写）。
+    修复点：旧实现把"任一函数抛异常"一律判不等价，
+    会把"两者都抛同类异常"的合法重写误杀。"""
     for s in samples:
-        try:
-            if fn_old(s) != fn_new(s):
-                return False
-        except Exception:
-            return False
-    return True
+        if _call(fn_old, s) != _call(fn_new, s):
+            return False, s
+    return True, None
 
 
 # ---------- Layer 3: 代价评估 ----------
 
 def benchmark(fn, samples, rounds=30):
-    """实测平均单次耗时（ms）。不信预测，只信秒表。"""
+    """实测平均单次耗时（ms）。不信预测，只信秒表。
+    注：adopt 闸门已改用 benchmark_pair（配对+中位数+符号检验）。
+    此单测函数保留供外部自行测量使用，不参与入库决策。"""
     ts = []
     for _ in range(rounds):
         t0 = time.perf_counter()
@@ -98,20 +130,98 @@ def benchmark(fn, samples, rounds=30):
     return statistics.mean(ts) / max(len(samples), 1)
 
 
+def benchmark_pair(fn_old, fn_new, samples, rounds=9):
+    """配对交替测量（数学升级）：同轮内 old/new 交替计时，控制环境漂移。
+    返回 (med_speedup, p_value, wins, n_pairs, med_old_ms, med_new_ms)。
+    - 中位数加速比：抗噪（mean 对 GC/调度异常值敏感）
+    - sign test（配对符号检验，纯 stdlib 二项分布）：
+      H0 = 新旧无差异，p = P(Bin(rounds, 0.5) >= wins)。
+      rounds=9 时全胜 p≈0.002，噪声翻不出显著性，假阳性被统计检验挡住。"""
+    pairs = []
+    for _ in range(rounds):
+        t0 = time.perf_counter()
+        for s in samples:
+            fn_old(s)
+        to = (time.perf_counter() - t0) * 1000 / max(len(samples), 1)
+        t0 = time.perf_counter()
+        for s in samples:
+            fn_new(s)
+        tn = (time.perf_counter() - t0) * 1000 / max(len(samples), 1)
+        pairs.append((to, tn))
+    wins = sum(1 for a, b in pairs if b < a)
+    p = sum(math.comb(rounds, k) for k in range(wins, rounds + 1)) / (2 ** rounds)
+    med_old = statistics.median(a for a, _ in pairs)
+    med_new = statistics.median(b for _, b in pairs)
+    return med_old / max(med_new, 1e-9), round(p, 4), wins, len(pairs), med_old, med_new
+
+
+def witness_at_scale(kind, spec, n, n_samples=10, seed=42):
+    """按给定规模生成随机样本（跨规模采样用）。
+    rand_int / binary_seq 无规模维度，返回 None（不可跨规模分析）。"""
+    rng = random.Random(seed)
+    if kind == "rand_int_list":
+        return [[rng.randint(0, 99) for _ in range(n)] for _ in range(n_samples)]
+    if kind == "rand_str":
+        alpha = string.ascii_letters + string.digits
+        return ["".join(rng.choice(alpha) for _ in range(n)) for _ in range(n_samples)]
+    if kind == "rand_rows":
+        c = spec.get("cols", 6)
+        return [["".join(rng.choice(string.ascii_lowercase) for _ in range(4)) for _ in range(c)]
+                for _ in range(n)]
+    return None
+
+
+def crossing_analysis(fn_old, fn_new, kind, spec, sizes=None, rounds=9,
+                      threshold=DEFAULT_MIN_SPEEDUP, sample_fn=None):
+    """跨规模配对测量，找交叉点 n*（数学升级：规模维度）。
+    n* = 中位加速比首次 ≥ threshold 的最小规模；测过规模全不达标 → None
+    （说明该优化在当前样本形态下不赢——可能只在大得多的规模生效，或根本不赢）。
+    返回 {"curve": [(n, speedup), ...], "n_star": n* 或 None, "scalable": bool}
+    scalable=False 表示该 witness kind 无规模维度。curve 可直接入库，report 展示。
+    sample_fn：可选自定义规模样本生成器 sample_fn(n) -> 样本列表。
+    默认证人类型可能与被测函数不匹配（如 str-join 域是 int 列表，
+    拼接函数需要字符串列表）——SKILL.md 明确"默认证人往往不够用，
+    必须传真实负载样本"，跨规模分析同理，用 sample_fn 传真实形态。"""
+    if sizes is None:
+        sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    curve, n_star = [], None
+    for n in sizes:
+        samples = sample_fn(n) if sample_fn is not None else witness_at_scale(kind, spec, n)
+        if samples is None:
+            return {"curve": curve, "n_star": n_star, "scalable": False}
+        med_sp = benchmark_pair(fn_old, fn_new, samples, rounds=rounds)[0]
+        curve.append((n, round(med_sp, 3)))
+        if n_star is None and med_sp >= threshold:
+            n_star = n
+    return {"curve": curve, "n_star": n_star, "scalable": True}
+
+
 # ---------- 统一入口：adopt ----------
 
 def adopt(name, fn_old, fn_new, domain_id, samples=None,
-          min_speedup=DEFAULT_MIN_SPEEDUP):
+          min_speedup=DEFAULT_MIN_SPEEDUP, analyze_crossing=False):
     """
-    把关流程：查域 → 取证人 → 等价验证 → 实测加速 → 入库。
-    任何一关不过都不污染库；未知域记入候选池（生长素材）。
-    samples 参数允许 LLM 在域证人之外补充正例（证人集也可进化）。
+    把关流程：查域 → 取证人（随机+边界）→ 等价验证（含异常语义，返回反例）
+    → 配对实测 + 符号检验 → 入库。
+    数学升级（v2 闸门）：
+    - 等价性：随机+边界混合证人；异常语义比较（都抛同类异常=等价）；
+      失败时返回首个反例样本（counterexample），LLM 据此一次改对
+    - 性能：配对交替测量 + 中位数加速比 + sign-test 显著性
+    - 双条件入库：中位加速比 ≥ 门槛，且经验域 sign-test p < SIGN_ALPHA
+      （零一完备域 complete=true 正确性已有数学保障，豁免显著性——
+       性能门槛的意义仅是"别倒退太多"，无噪声假阳性污染风险）
+    - 规模维度：analyze_crossing=True 时跨规模测交叉点 n*（何时才开始赢）
+    - 版本感知：入库记录带 py_version（加速比是 CPython 版本的函数）
+    - 统计背书：入库记录带 speedup_med / p_value / n_pairs / wins
+    samples 参数允许 LLM 在域证人之外补充正例（证人集也可进化）；
+    传了 samples 则边界由调用方负责。
     """
     dom = next((d for d in DOMAINS["domains"] if d["id"] == domain_id), None)
     if dom is None:
         with CAND.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": time.time(), "name": name,
-                                "domain_id": domain_id}, ensure_ascii=False) + "\n")
+                                "domain_id": domain_id,
+                                "outcome": "candidate"}, ensure_ascii=False) + "\n")
         return {"ok": False, "stage": "domain",
                 "note": f"未知域 '{domain_id}'，已记候选，攒证据后蒸馏新域"}
 
@@ -121,29 +231,51 @@ def adopt(name, fn_old, fn_new, domain_id, samples=None,
     used_custom = samples is not None
     if samples is None:
         samples = make_witnesses(dom["witness"])
-    if not verify_equivalence(fn_old, fn_new, samples):
-        return {"ok": False, "stage": "verify",
-                "note": "等价性验证未过（存在反例），拒绝入库"}
+    ok, cx = verify_equivalence(fn_old, fn_new, samples)
+    if not ok:
+        note = "等价性验证未过（随机+边界证人，含异常语义）"
+        if cx is not None:
+            note += f"，首个反例: {cx!r}"
+        return {"ok": False, "stage": "verify", "counterexample": cx, "note": note}
 
-    t_old = benchmark(fn_old, samples)
-    t_new = benchmark(fn_new, samples)
-    speedup = t_old / max(t_new, 1e-9)
+    med_sp, p_val, wins, n_pairs, med_old, med_new = benchmark_pair(
+        fn_old, fn_new, samples)
+    complete = dom.get("complete", False)
+    if med_sp < min_speedup:
+        return {"ok": False, "stage": "bench", "speedup": round(med_sp, 3),
+                "p_value": p_val,
+                "note": f"中位加速 {med_sp:.2f}x 未达 {min_speedup}x 门槛，拒绝入库"}
+    if not complete and p_val >= SIGN_ALPHA:
+        return {"ok": False, "stage": "bench", "speedup": round(med_sp, 3),
+                "p_value": p_val,
+                "note": f"中位加速 {med_sp:.2f}x 但 sign-test p={p_val} 不显著"
+                        f"（{wins}/{n_pairs} 轮新更快），噪声风险，拒绝入库"}
+
     witness_label = "custom" if used_custom else dom["witness"]["kind"]
-    if speedup < min_speedup:
-        return {"ok": False, "stage": "bench", "speedup": round(speedup, 3),
-                "note": f"加速 {speedup:.2f}x 未达 {min_speedup}x 门槛，拒绝入库"}
-
     rec = {"ts": time.time(), "name": name, "domain": domain_id,
-           "speedup": round(speedup, 3),
-           "old_ms": round(t_old, 5), "new_ms": round(t_new, 5),
+           "speedup": round(med_sp, 3),
+           "speedup_med": round(med_sp, 3), "p_value": p_val,
+           "n_pairs": n_pairs, "wins": wins,
+           "old_ms": round(med_old, 5), "new_ms": round(med_new, 5),
            "witness": witness_label,
-           "complete": dom.get("complete", False),
-           "samples": len(samples)}
+           "complete": complete,
+           "samples": len(samples),
+           "py_version": _CUR_PY_VERSION}
+    ret = {"ok": True, "speedup": round(med_sp, 3), "p_value": p_val,
+           "wins": wins, "n_pairs": n_pairs,
+           "old_ms": round(med_old, 5), "new_ms": round(med_new, 5),
+           "witness": witness_label, "complete": complete,
+           "py_version": _CUR_PY_VERSION}
+    if analyze_crossing and not used_custom:
+        ca = crossing_analysis(fn_old, fn_new, dom["witness"]["kind"], dom["witness"])
+        if ca.get("scalable"):
+            rec["n_star"] = ca["n_star"]
+            rec["curve"] = ca["curve"]
+            ret["n_star"] = ca["n_star"]
+            ret["curve"] = ca["curve"]
     with LIB.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    return {"ok": True, "speedup": round(speedup, 3),
-            "old_ms": round(t_old, 5), "new_ms": round(t_new, 5),
-            "witness": witness_label, "complete": dom.get("complete", False)}
+    return ret
 
 
 # ---------- 报告 ----------
@@ -151,15 +283,45 @@ def adopt(name, fn_old, fn_new, domain_id, samples=None,
 def report():
     lib = [json.loads(l) for l in LIB.read_text(encoding="utf-8").splitlines() if l.strip()] if LIB.exists() else []
     cand = [json.loads(l) for l in CAND.read_text(encoding="utf-8").splitlines() if l.strip()] if CAND.exists() else []
+    retr = [json.loads(l) for l in RETRACT.read_text(encoding="utf-8").splitlines() if l.strip()] if RETRACT.exists() else []
+    retr_names = {r["name"] for r in retr}
     print(f"已认证优化: {len(lib)} 条")
     for r in lib:
         mark = " [零一完备]" if r.get("complete") else ""
+        if r.get("p_value") is not None:
+            stat = f" p={r['p_value']} ({r.get('wins', '?')}/{r.get('n_pairs', '?')}轮)"
+        else:
+            stat = " [无统计背书·旧闸门记录，待复核]"
+        if r.get("n_star") is not None:
+            stat += f" 交叉点n*={r['n_star']}"
+        if r.get("py_version") and r["py_version"] != _CUR_PY_VERSION:
+            stat += f" [版本{r['py_version']}，当前{_CUR_PY_VERSION}，加速比可能已失效]"
+        if r["name"] in retr_names:
+            stat += " [已作废，见下]"
         print(f"  {r['name']} ({r['domain']}): {r['speedup']}x  "
-              f"{r['old_ms']}ms→{r['new_ms']}ms  证人={r['witness']}×{r['samples']}{mark}")
+              f"{r['old_ms']}ms→{r['new_ms']}ms  证人={r['witness']}×{r['samples']}{stat}{mark}")
+    if retr:
+        print(f"已作废记录: {len(retr)} 条（审计保留，不删库）")
+        for r in retr:
+            extra = f" 复核={r.get('recheck_speedup')}x" if r.get("recheck_speedup") else ""
+            print(f"  {r['name']} ({r.get('domain', '?')}): 作废原因={r['reason']}{extra}")
     print(f"待蒸馏候选: {len(cand)} 条")
     for r in cand:
-        print(f"  {r['name']} → 声称域 '{r['domain_id']}'（攒证据中）")
-    return {"certified": len(lib), "candidates": len(cand)}
+        oc = r.get("outcome", "candidate")
+        print(f"  {r['name']} → 声称域 '{r['domain_id']}'（{oc}）")
+    return {"certified": len(lib), "candidates": len(cand), "retracted": len(retr)}
+
+
+def retract(name, reason, domain=None, recheck_speedup=None):
+    """把库中某条记录作废（审计保留：不删 library.jsonl，只追加作废清单）。
+    用途：v2.1 新闸门复核实测为假阳性（如旧闸门噪声假加速、版本失效导致重写倒退）。
+    reason 必填（作废依据）；recheck_speedup 为复核实测值（如 0.896 = 反而更慢）。"""
+    with RETRACT.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": time.time(), "name": name,
+                            "domain": domain, "reason": reason,
+                            "recheck_speedup": recheck_speedup},
+                           ensure_ascii=False) + "\n")
+    return {"ok": True, "name": name, "reason": reason}
 
 
 # ---------- 成长机制（引子） ----------
@@ -333,17 +495,23 @@ def add_domain(entry):
 
 
 def growth_signals():
-    """扫描候选池，返回各域的候选计数及是否达到蒸馏阈值。
-    ready=True 的域 = '值得专门造一个证人集'的信号。"""
+    """扫描候选池，返回各域的候选计数、ready 标志及 outcome 分布。
+    ready=True 的域 = '值得专门造一个证人集'的信号。
+    outcomes 记录每次尝试的结果（candidate=仅入池；立域后实际验证结果
+    会补记 pass/fail），供立域决策参考成功率（数学升级：不看次数，看成功率）。"""
     if not CAND.exists():
         return []
     cands = [json.loads(l) for l in CAND.read_text(encoding="utf-8").splitlines() if l.strip()]
-    counts = {}
+    agg = {}
     for c in cands:
         did = c.get("domain_id", "?")
-        counts[did] = counts.get(did, 0) + 1
-    return [{"domain_id": k, "count": v, "ready": v >= DISTILL_THRESHOLD}
-            for k, v in sorted(counts.items(), key=lambda x: -x[1])]
+        a = agg.setdefault(did, {"count": 0, "outcomes": {}})
+        a["count"] += 1
+        oc = c.get("outcome", "candidate")
+        a["outcomes"][oc] = a["outcomes"].get(oc, 0) + 1
+    return [{"domain_id": k, "count": v["count"], "ready": v["count"] >= DISTILL_THRESHOLD,
+             "outcomes": v["outcomes"]}
+            for k, v in sorted(agg.items(), key=lambda x: -x[1]["count"])]
 
 
 # ---------- Demo：三个真实场景实测 ----------
@@ -355,7 +523,9 @@ def demo():
     print("  selfopt demo：LLM 生成重写，selfopt 把关入库")
     print("=" * 60)
 
-    # 场景1: 循环字符串拼接 → join
+    # 场景1: 循环字符串拼接 → join（注意：边界样本 [] 会抓住不等价！
+    #   join_old([]) 返回 ''，join_new([]) 返回 ',' —— 纯随机证人无空列表，
+    #   旧闸门会放行这个"看似等价"的重写；v2 边界证人在空输入上现形。）
     def join_old(row):
         s = ""
         for x in row:
@@ -367,6 +537,8 @@ def demo():
 
     r1 = adopt("build_csv_row", join_old, join_new, "str-join")
     print(f"\n[场景1] 字符串拼接→join: {r1}")
+    print("        ↑ 边界样本 [] 抓到真实不等价：旧返回 '', 新返回 ','")
+    print("          （旧纯随机闸门会放行；v2 边界证人正确拒绝）")
 
     # 场景2: 调用内重复编译正则 → 模块级预编译
     def re_old(s):

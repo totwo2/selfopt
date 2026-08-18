@@ -3,6 +3,7 @@
 端到端成长测试：验证引子能否健康发芽
 完整生命周期：未知域出现 → 候选积累 → 蒸馏信号触发 → 新域入库 → 后续成功复用 → 坏重写被拦
 """
+import json
 import os
 import sys
 import time as _time
@@ -42,21 +43,91 @@ def ts_format_bad(epoch):
     return f"{t.tm_year}/{t.tm_mon}/{t.tm_mday}"
 
 
-def main():
-    # 清理上次崩溃残留的 .bak
-    if os.path.exists(BAK_FILE):
-        shutil.move(BAK_FILE, DOM_FILE)
+def test_math_gate_v2():
+    """v2 数学闸门回归测试：边界样本、异常语义、反例返回、
+    配对符号检验、交叉点、版本感知。"""
+    print("=" * 60)
+    print("  数学闸门 v2 回归测试")
+    print("=" * 60)
 
-    shutil.copy2(DOM_FILE, BAK_FILE)
-    selfopt.LIB.unlink(missing_ok=True)
-    selfopt.CAND.unlink(missing_ok=True)
+    # T1: 洞1 —— 边界样本抓住"空列表才炸"的错误重写
+    print("\n▶ T1: 边界样本抓空列表错误")
+    def sum_old(xs):
+        s = 0
+        for x in xs:
+            s += x
+        return s
+    def sum_buggy(xs):
+        return sum(xs) if xs else xs[0]
+    r = selfopt.adopt("t1_sum_buggy", sum_old, sum_buggy, "list-to-set-membership")
+    print(f"  {r}")
+    assert r["stage"] == "verify", f"T1 失败：边界样本没抓住空列表错误 {r}"
+    assert r.get("counterexample") == [], f"T1 失败：反例应为空列表 []，得到 {r.get('counterexample')}"
 
-    try:
-        _run_test()
-    finally:
-        shutil.move(BAK_FILE, DOM_FILE)
-        shutil.rmtree(_TMP, ignore_errors=True)
-        print("\n  (domains.json 已恢复，临时数据目录已清理)")
+    # T2: 洞2 —— 两个相同函数，噪声翻不出显著性
+    print("\n▶ T2: 相同函数噪声拒绝")
+    def same_a(xs):
+        s = 0
+        for x in xs:
+            s += x
+        return s
+    same_b = same_a
+    r = selfopt.adopt("t2_same", same_a, same_b, "str-join",
+                      samples=[list(range(300)) for _ in range(20)])
+    print(f"  {r}")
+    assert r["ok"] is False and r["stage"] == "bench", f"T2 失败：相同函数不该入库 {r}"
+
+    # T3: 异常语义 —— 都抛同类异常 = 等价
+    print("\n▶ T3: 异常语义等价")
+    def old_raises(x):
+        if x < 0:
+            raise ValueError("neg")
+        return x * 2
+    def new_raises(x):
+        if x < 0:
+            raise ValueError("neg")
+        return x + x
+    ok, cx = selfopt.verify_equivalence(old_raises, new_raises, [-5, 3])
+    assert ok and cx is None, f"T3 失败：都抛 ValueError 应判等价 {ok} {cx}"
+    def new_diff_exc(x):
+        if x < 0:
+            raise TypeError("different")
+        return x + x
+    ok, cx = selfopt.verify_equivalence(old_raises, new_diff_exc, [-5, 3])
+    assert not ok and cx == -5, f"T3 失败：异常类型不同应判不等价且反例=-5 {ok} {cx}"
+    print("  都抛同类异常=等价 ✓  异常类型不同=不等价且反例=-5 ✓")
+
+    # T4: 交叉点 —— str-join 大规模才赢，n* 应存在
+    # 注：str-join 域默认证人是 int 列表，与拼接函数类型不匹配，
+    # 用 sample_fn 传真实形态（字符串列表）——SKILL.md"默认证人不够用"同理。
+    print("\n▶ T4: 交叉点（跨规模）")
+    def join_old(row):
+        s = ""
+        for x in row:
+            s += x + ","
+        return s
+    def join_new(row):
+        return ",".join(row) + ","
+    def str_rows(n):
+        return [["x" + str(i % 10) for i in range(n)] for _ in range(10)]
+    ca = selfopt.crossing_analysis(
+        join_old, join_new, "rand_int_list", {}, threshold=1.0,
+        sizes=[1, 4, 16, 64, 256, 1024], sample_fn=str_rows)
+    print(f"  曲线: {ca['curve']}, n*={ca['n_star']}, scalable={ca['scalable']}")
+    assert ca["scalable"], "T4 失败：rand_int_list 应可跨规模分析"
+    assert ca["n_star"] is not None, (
+        f"T4 失败：join vs += 在大规模应至少不吃亏（CPython {selfopt._CUR_PY_VERSION}）")
+
+    # T5: 版本感知 —— 入库记录带 py_version
+    print("\n▶ T5: 版本感知")
+    import platform as _pl
+    recs = [json.loads(l) for l in selfopt.LIB.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert all(r.get("py_version") == _pl.python_version() for r in recs), \
+        f"T5 失败：入库记录应带当前版本 {_pl.python_version()}"
+    print(f"  所有入库记录 py_version = {_pl.python_version()} ✓")
+
+    print("\n▶ 数学闸门 v2 全部通过 ✓")
+
 
 
 def _run_test():
@@ -93,7 +164,12 @@ def _run_test():
     r = selfopt.add_domain(new_domain)
     print(f"  {r}")
     assert r["ok"], "add_domain 失败！"
-    assert r["total_domains"] == 7, f"域总数应为 7，得到 {r['total_domains']}"
+    # 动态断言：加域后总数 = 当前域数 + 1（域库会随成长增长，不硬编码数字）
+    import json as _json
+    with open(DOM_FILE, encoding="utf-8") as f:
+        _cur_n = len(_json.load(f)["domains"]) - 1
+    assert r["total_domains"] == _cur_n + 1, \
+        f"域总数应为 {_cur_n + 1}，得到 {r['total_domains']}"
 
     # 幂等
     r2 = selfopt.add_domain(new_domain)
@@ -120,6 +196,24 @@ def _run_test():
     print("\n" + "=" * 60)
     print("  全部断言通过：引子健康发芽 ✓")
     print("=" * 60)
+
+
+def main():
+    # 清理上次崩溃残留的 .bak
+    if os.path.exists(BAK_FILE):
+        shutil.move(BAK_FILE, DOM_FILE)
+
+    shutil.copy2(DOM_FILE, BAK_FILE)
+    selfopt.LIB.unlink(missing_ok=True)
+    selfopt.CAND.unlink(missing_ok=True)
+
+    try:
+        _run_test()
+        test_math_gate_v2()
+    finally:
+        shutil.move(BAK_FILE, DOM_FILE)
+        shutil.rmtree(_TMP, ignore_errors=True)
+        print("\n  (domains.json 已恢复，临时数据目录已清理)")
 
 
 if __name__ == "__main__":
